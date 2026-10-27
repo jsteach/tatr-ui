@@ -1,6 +1,7 @@
 #include "tatr.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -363,38 +364,87 @@ void tatr_sort(TatrList *list, bool by_id, bool ascending) {
               : (ascending ? cmp_priority_asc : cmp_priority_desc));
 }
 
-static int path_exists(const char *p) {
-    struct stat st;
-    return stat(p, &st) == 0;
+static int copy_path(char *dst, size_t dst_size, const char *src) {
+    size_t len = strlen(src);
+    if (!dst_size || len >= dst_size) return 0;
+    memcpy(dst, src, len + 1);
+    return 1;
+}
+
+static int path_is_tasks_dir(const char *path) {
+    size_t len = strlen(path);
+    while (len > 1 && (path[len - 1] == '/' || path[len - 1] == '\\')) --len;
+    const char *base = path + len;
+    while (base > path && base[-1] != '/' && base[-1] != '\\') --base;
+    size_t base_len = (size_t)((path + len) - base);
+    if (base_len != 5) return 0;
+#ifdef _WIN32
+    return _strnicmp(base, "tasks", base_len) == 0;
+#else
+    return strncmp(base, "tasks", base_len) == 0;
+#endif
+}
+
+static int resolve_tasks_dir(const char *project_or_tasks_dir,
+                             char *buf, size_t buflen) {
+    if (!project_or_tasks_dir || !*project_or_tasks_dir) return 0;
+    if (path_is_tasks_dir(project_or_tasks_dir) &&
+        is_dir(project_or_tasks_dir)) {
+        return copy_path(buf, buflen, project_or_tasks_dir);
+    }
+
+    size_t len = strlen(project_or_tasks_dir);
+    int separator = len > 0 && (project_or_tasks_dir[len - 1] == '/' ||
+                                project_or_tasks_dir[len - 1] == '\\');
+    int written = snprintf(buf, buflen, "%s%stasks", project_or_tasks_dir,
+                           separator ? "" : "/");
+    return written >= 0 && (size_t)written < buflen && is_dir(buf);
+}
+
+int tatr_get_current_dir(char *buf, size_t buflen) {
+#ifdef _WIN32
+    if (buflen > INT_MAX || !_getcwd(buf, (int)buflen)) return 0;
+#else
+    if (!getcwd(buf, buflen)) return 0;
+#endif
+    return 1;
 }
 
 const char *tatr_find_tasks_dir(const char *explicit_dir, char *buf, size_t buflen) {
+    if (!buf || !buflen) return NULL;
+    buf[0] = 0;
     if (explicit_dir) {
-        snprintf(buf, buflen, "%s", explicit_dir);
-        return buf;
+        return resolve_tasks_dir(explicit_dir, buf, buflen) ? buf : NULL;
     }
-    char cwd[512];
-#ifdef _WIN32
-    if (!_getcwd(cwd, (int)sizeof(cwd))) return NULL;
-#else
-    if (!getcwd(cwd, sizeof(cwd))) return NULL;
-#endif
-    char cur[512];
-    snprintf(cur, sizeof(cur), "%s", cwd);
-    for (int up = 0; up < 8; ++up) {
-        snprintf(buf, buflen, "%s/tasks", cur);
-        if (is_dir(buf)) return buf;
+
+    char cur[4096];
+    if (!tatr_get_current_dir(cur, sizeof(cur))) return NULL;
+    for (;;) {
+        if (resolve_tasks_dir(cur, buf, buflen)) return buf;
+        size_t len = strlen(cur);
+        while (len > 1 && (cur[len - 1] == '/' || cur[len - 1] == '\\')) {
+            cur[--len] = 0;
+        }
         char *slash = strrchr(cur, '/');
 #ifdef _WIN32
         char *bslash = strrchr(cur, '\\');
         if (bslash && (!slash || bslash > slash)) slash = bslash;
 #endif
-        if (!slash || slash == cur) break;
-        *slash = 0;
+        if (!slash) break;
+#ifdef _WIN32
+        if (slash == cur + 2 && cur[1] == ':') {
+            slash[1] = 0;
+        } else
+#endif
+        if (slash == cur) {
+            slash[1] = 0;
+            if (resolve_tasks_dir(cur, buf, buflen)) return buf;
+            break;
+        } else {
+            *slash = 0;
+        }
     }
-    snprintf(buf, buflen, "%s/tasks", cwd);
-    (void)path_exists;
-    return buf;
+    return NULL;
 }
 
 void tatr_format_tags(const TatrTask *t, char *out, size_t n) {

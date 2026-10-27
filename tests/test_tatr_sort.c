@@ -47,5 +47,15 @@ int main(void) {
     assert(parsed.items[0].priority == 1000);
     assert(!parsed.items[1].has_priority);
     tatr_list_free(&parsed);
+
+    char tasks_dir[1024];
+    assert(tatr_find_tasks_dir("tests/fixtures/project", tasks_dir,
+                               sizeof(tasks_dir)) != NULL);
+    assert(strcmp(tasks_dir, "tests/fixtures/project/tasks") == 0);
+    assert(tatr_find_tasks_dir("tests/fixtures/project/tasks", tasks_dir,
+                               sizeof(tasks_dir)) != NULL);
+    assert(strcmp(tasks_dir, "tests/fixtures/project/tasks") == 0);
+    assert(tatr_find_tasks_dir("tests/fixtures", tasks_dir,
+                               sizeof(tasks_dir)) == NULL);
     return 0;
 }

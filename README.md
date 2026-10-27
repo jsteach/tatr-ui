@@ -28,12 +28,15 @@ each platform rather than as one Cosmopolitan single-binary artifact.
 
 ## Run
 
-Pass a TATR `tasks/` directory, or run the application inside a project that
-has a `tasks/` directory in the current or a parent folder:
+Pass a project folder or its TATR `tasks/` directory to open it directly:
 
 ```sh
-build/tatr-ui path/to/project/tasks
+build/tatr-ui path/to/project
 ```
+
+Without an argument, the app opens a welcome window with a **Choose project
+folder** button. Use **Open project** in the task browser to switch projects.
+The chosen folder can be either the project root or its `tasks/` directory.
 
 If no system font is found automatically, set `TATR_FONT` to a TrueType font
 file. The application tries `TATR_FONT` first.
@@ -56,4 +59,5 @@ browse in timestamp order.
 ## Third-party licenses
 
 Fenster and Lite are included under their MIT licenses in `src/vendor`.
-`stb_truetype.h` is public domain.
+tinyfiledialogs is included under its zlib license, and `stb_truetype.h` is
+public domain.

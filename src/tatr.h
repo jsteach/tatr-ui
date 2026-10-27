@@ -52,6 +52,7 @@ bool tatr_load_dir(TatrList *list, const char *dir);
 bool tatr_load_tag_docs(TatrTagDocs *docs, const char *dir);
 void tatr_sort(TatrList *list, bool by_id, bool ascending);
 const char *tatr_find_tasks_dir(const char *explicit_dir, char *buf, size_t buflen);
+int tatr_get_current_dir(char *buf, size_t buflen);
 int tatr_status_is_closed(const TatrTask *t);
 void tatr_format_tags(const TatrTask *t, char *out, size_t n);
 const char *tatr_tag_desc(const TatrTagDocs *docs, const char *name);

@@ -3,6 +3,7 @@
 #include "renderer.h"
 #include "vendor/fenster.h"
 #include "vendor/lite/rencache.h"
+#include "vendor/tinyfiledialogs/tinyfiledialogs.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -108,6 +109,24 @@ static UiLayout make_layout(int width, int height) {
     layout.sort_w = toolbar_width - 3 * layout.filter_w - 24;
     if (layout.sort_w < 1) layout.sort_w = 1;
     return layout;
+}
+
+static int project_button_width(const UiLayout *layout) {
+    return clamp_int(layout->width / 5, 90, 132);
+}
+
+static RenRect welcome_button_rect(const UiLayout *layout) {
+    int width = clamp_int(layout->width / 3, 1, 210);
+    if (width > layout->width - 2 * layout->margin)
+        width = layout->width - 2 * layout->margin;
+    if (width < 1) width = 1;
+    int height = 40;
+    return (RenRect){
+        (layout->width - width) / 2,
+        layout->height / 2 + 42,
+        width,
+        height
+    };
 }
 
 static RenColor rgb(unsigned char r, unsigned char g, unsigned char b) {
@@ -419,6 +438,34 @@ static void draw_details(const TatrList *list, const TatrTask *task,
 static void draw_ui(const TatrList *list, const TatrTagDocs *tags,
                     const char *tasks_dir, UiState *state,
                     const UiLayout *layout) {
+    if (!tasks_dir[0]) {
+        rencache_begin_frame();
+        rect(0, 0, layout->width, layout->height, rgb(15, 19, 26));
+        text("TATR", 26, 22, rgb(234, 241, 250));
+
+        int card_width = layout->width - 2 * layout->margin;
+        if (card_width > 560) card_width = 560;
+        if (card_width < 1) card_width = 1;
+        int card_height = 230;
+        int card_x = (layout->width - card_width) / 2;
+        int card_y = (layout->height - card_height) / 2;
+        rect(card_x, card_y, card_width, card_height, rgb(22, 27, 36));
+        text("Welcome to TATR", card_x + 28, card_y + 32,
+             rgb(235, 241, 249));
+        text("Open a project folder to browse its tasks.",
+             card_x + 28, card_y + 76, rgb(160, 174, 192));
+        text("Choose either the project root or its tasks folder.",
+             card_x + 28, card_y + 106, rgb(130, 148, 170));
+
+        RenRect button = welcome_button_rect(layout);
+        rect(button.x, button.y, button.width, button.height,
+             rgb(46, 80, 105));
+        text("Choose project folder", button.x + 17, button.y + 11,
+             rgb(220, 241, 255));
+        rencache_end_frame();
+        return;
+    }
+
     size_t count = visible_count(list, state->filter);
     const TatrTask *selected = count
         ? visible_task(list, state->filter, state->selected) : NULL;
@@ -426,11 +473,15 @@ static void draw_ui(const TatrList *list, const TatrTagDocs *tags,
     rencache_begin_frame();
     rect(0, 0, layout->width, layout->height, rgb(15, 19, 26));
     text("TATR", 26, 22, rgb(234, 241, 250));
+    int project_button_w = project_button_width(layout);
+    int project_button_x = layout->width - layout->margin - project_button_w;
+    draw_button(project_button_w >= 120 ? "Open project" : "Project",
+                project_button_x, 18, project_button_w, 0);
     char subtitle[320];
     snprintf(subtitle, sizeof(subtitle), "%zu task%s  |  %s",
              list->count, list->count == 1 ? "" : "s", tasks_dir);
     char fitted[320];
-    fit_text(subtitle, layout->width - 170, fitted, sizeof(fitted));
+    fit_text(subtitle, project_button_x - 132, fitted, sizeof(fitted));
     text(fitted, 114, 27, rgb(130, 148, 170));
 
     draw_list(list, state, count, layout);
@@ -438,8 +489,57 @@ static void draw_ui(const TatrList *list, const TatrTagDocs *tags,
     rencache_end_frame();
 }
 
+static void show_project_error(const char *message) {
+    tinyfd_messageBox("TATR", message, "ok", "error", 1);
+}
+
+static void choose_project(TatrList *list, TatrTagDocs *tags,
+                           char *tasks_dir, size_t tasks_dir_size,
+                           UiState *state) {
+    char *selected = tinyfd_selectFolderDialog("Choose a TATR project folder",
+                                                NULL);
+    if (!selected) return;
+
+    char new_tasks_dir[4096];
+    const char *resolved = tatr_find_tasks_dir(selected, new_tasks_dir,
+                                                sizeof(new_tasks_dir));
+    if (!resolved) {
+        show_project_error("The selected folder has no tasks directory.");
+        return;
+    }
+    if (strlen(new_tasks_dir) >= tasks_dir_size) {
+        show_project_error("The selected tasks directory path is too long.");
+        return;
+    }
+
+    TatrList new_list = {0};
+    TatrTagDocs new_tags = {0};
+    if (!tatr_load_dir(&new_list, new_tasks_dir)) {
+        show_project_error("Unable to read tasks from the selected project.");
+        tatr_list_free(&new_list);
+        return;
+    }
+    if (!tatr_load_tag_docs(&new_tags, new_tasks_dir)) {
+        show_project_error("Unable to read tag documentation from the selected project.");
+        tatr_list_free(&new_list);
+        tatr_tags_free(&new_tags);
+        return;
+    }
+
+    tatr_sort(&new_list, state->sort_by_id, state->ascending);
+    tatr_list_free(list);
+    tatr_tags_free(tags);
+    *list = new_list;
+    *tags = new_tags;
+    memcpy(tasks_dir, new_tasks_dir, strlen(new_tasks_dir) + 1);
+    state->selected = 0;
+    state->scroll = 0;
+}
+
 static int handle_input(struct fenster *window, TatrList *list,
-                         UiState *state, const UiLayout *layout) {
+                         TatrTagDocs *tags, char *tasks_dir,
+                         size_t tasks_dir_size, UiState *state,
+                         const UiLayout *layout) {
     size_t count = visible_count(list, state->filter);
     int down_pressed = key_pressed(window, state, 18);
     int up_pressed = key_pressed(window, state, 17);
@@ -480,7 +580,18 @@ static int handle_input(struct fenster *window, TatrList *list,
     if (mouse_down && !state->mouse_was_down) {
         int x = window->x;
         int y = window->y;
-        if (point_in_rect(x, y, layout->filter_x[0], layout->sidebar_y + 44,
+        RenRect welcome_button = welcome_button_rect(layout);
+        int project_width = project_button_width(layout);
+        int project_button_x = layout->width - layout->margin - project_width;
+        if (!tasks_dir[0] &&
+            point_in_rect(x, y, welcome_button.x, welcome_button.y,
+                          welcome_button.width, welcome_button.height)) {
+            choose_project(list, tags, tasks_dir, tasks_dir_size, state);
+        } else if (tasks_dir[0] &&
+                   point_in_rect(x, y, project_button_x, 18,
+                                 project_width, 30)) {
+            choose_project(list, tags, tasks_dir, tasks_dir_size, state);
+        } else if (point_in_rect(x, y, layout->filter_x[0], layout->sidebar_y + 44,
                           layout->filter_w, 30)) {
             state->filter = FILTER_ALL;
             state->selected = state->scroll = 0;
@@ -545,7 +656,8 @@ static RenFont *load_ui_font(void) {
     return NULL;
 }
 
-int tatr_desktop_ui(TatrList *list, TatrTagDocs *tags, const char *tasks_dir) {
+int tatr_desktop_ui(TatrList *list, TatrTagDocs *tags, char *tasks_dir,
+                    size_t tasks_dir_size) {
     UiState state = {0};
     state.filter = FILTER_OPEN;
     uint32_t *pixels = (uint32_t *)calloc(
@@ -582,7 +694,8 @@ int tatr_desktop_ui(TatrList *list, TatrTagDocs *tags, const char *tasks_dir) {
     while (running) {
         if (fenster_loop(&window) < 0) break;
         UiLayout layout = make_layout(window.width, window.height);
-        if (handle_input(&window, list, &state, &layout)) running = 0;
+        if (handle_input(&window, list, tags, tasks_dir, tasks_dir_size,
+                         &state, &layout)) running = 0;
         if (!running) break;
         draw_ui(list, tags, tasks_dir, &state, &layout);
         fenster_sleep(16);

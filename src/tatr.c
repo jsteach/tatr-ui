@@ -1,14 +1,24 @@
+#ifndef _WIN32
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#endif
+
 #include "tatr.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #ifdef _WIN32
 #include <direct.h>
+#include <io.h>
+#include <windows.h>
 #ifndef S_ISDIR
 #define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
 #endif
@@ -50,6 +60,10 @@ static char *xstrdup(const char *s) {
     if (p) memcpy(p, s, n);
     return p;
 }
+
+static int set_error(char *error, size_t error_size, const char *message);
+static int path_join(char *out, size_t out_size,
+                     const char *dir, const char *name);
 
 static char *dup_range(const char *s, size_t n) {
     char *p = (char *)malloc(n + 1);
@@ -324,6 +338,65 @@ bool tatr_load_tag_docs(TatrTagDocs *docs, const char *dir) {
     return true;
 }
 
+bool tatr_create_tag(const char *tasks_dir, const char *name,
+                     char *error, size_t error_size) {
+    if (!tasks_dir || !*tasks_dir || !name || !*name || *name == '#') {
+        return set_error(error, error_size, "Enter a valid tag name.");
+    }
+    for (const unsigned char *p = (const unsigned char *)name; *p; ++p) {
+        if (isspace(*p) || *p == ',')
+            return set_error(error, error_size,
+                             "Tag names cannot contain spaces or commas.");
+    }
+
+    TatrTagDocs docs = {0};
+    if (!tatr_load_tag_docs(&docs, tasks_dir)) {
+        tatr_tags_free(&docs);
+        return set_error(error, error_size, "Unable to read project tags.");
+    }
+    for (size_t i = 0; i < docs.count; ++i) {
+        if (strcmp(docs.items[i].name, name) == 0) {
+            tatr_tags_free(&docs);
+            return set_error(error, error_size, "That tag already exists.");
+        }
+    }
+    tatr_tags_free(&docs);
+
+    char path[1024];
+    if (!path_join(path, sizeof(path), tasks_dir, "tags"))
+        return set_error(error, error_size, "Tags file path is too long.");
+    FILE *file = fopen(path, "a+b");
+    if (!file) return set_error(error, error_size, "Unable to open the tags file.");
+
+    int failed = 0;
+    if (fseek(file, 0, SEEK_END) != 0) {
+        failed = 1;
+    } else {
+        long length = ftell(file);
+        if (length < 0) {
+            failed = 1;
+        } else if (length > 0) {
+            if (fseek(file, -1, SEEK_END) != 0) {
+                failed = 1;
+            } else {
+                int last = fgetc(file);
+                if (last == EOF ||
+                    (last != '\n' &&
+                     (fseek(file, 0, SEEK_END) != 0 ||
+                      fputc('\n', file) == EOF)))
+                    failed = 1;
+            }
+        }
+    }
+    if (!failed && fseek(file, 0, SEEK_END) != 0) failed = 1;
+    if (!failed && fprintf(file, "%s\n", name) < 0) failed = 1;
+    if (fflush(file) != 0 || ferror(file)) failed = 1;
+    if (fclose(file) != 0) failed = 1;
+    if (failed)
+        return set_error(error, error_size, "Unable to write the tags file.");
+    return true;
+}
+
 static int cmp_priority_desc(const void *a, const void *b) {
     const TatrTask *ta = (const TatrTask *)a;
     const TatrTask *tb = (const TatrTask *)b;
@@ -362,6 +435,171 @@ void tatr_sort(TatrList *list, bool by_id, bool ascending) {
           by_id
               ? (ascending ? cmp_id_asc : cmp_id_desc)
               : (ascending ? cmp_priority_asc : cmp_priority_desc));
+}
+
+static int set_error(char *error, size_t error_size, const char *message) {
+    if (error && error_size) snprintf(error, error_size, "%s", message);
+    return 0;
+}
+
+static int has_line_break(const char *value) {
+    if (!value) return 0;
+    return strchr(value, '\n') != NULL || strchr(value, '\r') != NULL;
+}
+
+static int path_join(char *out, size_t out_size,
+                     const char *dir, const char *name) {
+    size_t dir_len = strlen(dir);
+    int separator = dir_len > 0 && dir[dir_len - 1] != '/' &&
+                    dir[dir_len - 1] != '\\';
+    int written = snprintf(out, out_size, "%s%s%s", dir,
+                           separator ? "/" : "", name);
+    return written >= 0 && (size_t)written < out_size;
+}
+
+static int write_task_file(const char *path, const TatrTask *task,
+                           const char *title, const char *status,
+                           bool has_priority, int priority,
+                           const char *tags, const char *body,
+                           char *error, size_t error_size) {
+    if (!title || !*title || has_line_break(title) || has_line_break(tags) ||
+        !status || (strcmp(status, "OPEN") != 0 &&
+                    strcmp(status, "CLOSED") != 0))
+        return set_error(error, error_size,
+                         "Title, tags, or status contain invalid values.");
+
+    char temp_path[2048];
+    int written = snprintf(temp_path, sizeof(temp_path), "%s.tmp", path);
+    if (written < 0 || (size_t)written >= sizeof(temp_path))
+        return set_error(error, error_size, "Task file path is too long.");
+
+    FILE *file = fopen(temp_path, "wb");
+    if (!file) return set_error(error, error_size, "Unable to create task file.");
+
+    int failed = fprintf(file, "# %s\n\n", title) < 0;
+    for (int i = 0; !failed && task && i < task->nprops; ++i) {
+        const char *key = task->props[i].key;
+        if (strcmp(key, "STATUS") == 0 || strcmp(key, "PRIORITY") == 0 ||
+            strcmp(key, "TAGS") == 0)
+            continue;
+        if (fprintf(file, "- %s: %s\n", key, task->props[i].value) < 0)
+            failed = 1;
+    }
+    if (!failed && fprintf(file, "- STATUS: %s\n", status) < 0) failed = 1;
+    if (!failed && has_priority &&
+        fprintf(file, "- PRIORITY: %d\n", priority) < 0)
+        failed = 1;
+    if (!failed && tags && *tags && fprintf(file, "- TAGS: %s\n", tags) < 0)
+        failed = 1;
+    if (!failed && body && *body) {
+        if (fputc('\n', file) == EOF || fputs(body, file) == EOF)
+            failed = 1;
+    }
+    if (fflush(file) != 0 || ferror(file)) failed = 1;
+    if (fclose(file) != 0) failed = 1;
+    if (failed) {
+        remove(temp_path);
+        return set_error(error, error_size, "Unable to write the task file.");
+    }
+
+#ifdef _WIN32
+    if (!MoveFileExA(temp_path, path,
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        remove(temp_path);
+        return set_error(error, error_size, "Unable to replace the task file.");
+    }
+#else
+    if (rename(temp_path, path) != 0) {
+        remove(temp_path);
+        return set_error(error, error_size, "Unable to replace the task file.");
+    }
+#endif
+    return 1;
+}
+
+bool tatr_save_task(const char *tasks_dir, const TatrTask *task,
+                    const char *title, const char *status,
+                    bool has_priority, int priority,
+                    const char *tags, const char *body,
+                    char *error, size_t error_size) {
+    if (!task || !task->path || !title || !*title || !status ||
+        (strcmp(status, "OPEN") != 0 && strcmp(status, "CLOSED") != 0)) {
+        return set_error(error, error_size, "Task title and status are required.");
+    }
+    (void)tasks_dir;
+    return write_task_file(task->path, task, title, status, has_priority,
+                           priority, tags, body, error, error_size) != 0;
+}
+
+bool tatr_create_task(const char *tasks_dir,
+                     const char *title, const char *status,
+                     bool has_priority, int priority,
+                     const char *tags, const char *body,
+                     char *created_id, size_t created_id_size,
+                     char *error, size_t error_size) {
+    if (!tasks_dir || !*tasks_dir || !title || !*title || !status ||
+        (strcmp(status, "OPEN") != 0 && strcmp(status, "CLOSED") != 0) ||
+        !created_id || !created_id_size) {
+        return set_error(error, error_size, "Task title and status are required.");
+    }
+
+    time_t now = time(NULL);
+    struct tm utc;
+#ifdef _WIN32
+    if (gmtime_s(&utc, &now) != 0)
+        return set_error(error, error_size, "Unable to read the current UTC time.");
+#else
+    if (!gmtime_r(&now, &utc))
+        return set_error(error, error_size, "Unable to read the current UTC time.");
+#endif
+    char base_id[32];
+    if (strftime(base_id, sizeof(base_id), "%Y%m%d-%H%M%S", &utc) == 0)
+        return set_error(error, error_size, "Unable to generate a task ID.");
+
+    char task_dir[2048];
+    char task_file[2048];
+    for (unsigned suffix = 0; suffix < 1000; ++suffix) {
+        if (suffix == 0) {
+            if (snprintf(created_id, created_id_size, "%s", base_id) < 0 ||
+                strlen(base_id) >= created_id_size)
+                return set_error(error, error_size, "Task ID buffer is too small.");
+        } else {
+            int id_len = snprintf(created_id, created_id_size, "%s-%u",
+                                  base_id, suffix);
+            if (id_len < 0 || (size_t)id_len >= created_id_size)
+                return set_error(error, error_size, "Task ID buffer is too small.");
+        }
+        if (!path_join(task_dir, sizeof(task_dir), tasks_dir, created_id))
+            return set_error(error, error_size, "Tasks directory path is too long.");
+        if (is_dir(task_dir)) continue;
+#ifdef _WIN32
+        if (_mkdir(task_dir) != 0) {
+#else
+        if (mkdir(task_dir, 0777) != 0) {
+#endif
+            if (errno == EEXIST) continue;
+            return set_error(error, error_size, "Unable to create the task folder.");
+        }
+        if (!path_join(task_file, sizeof(task_file), task_dir, "TASK.md")) {
+#ifdef _WIN32
+            _rmdir(task_dir);
+#else
+            rmdir(task_dir);
+#endif
+            return set_error(error, error_size, "Task file path is too long.");
+        }
+        if (!write_task_file(task_file, NULL, title, status, has_priority,
+                             priority, tags, body, error, error_size)) {
+#ifdef _WIN32
+            _rmdir(task_dir);
+#else
+            rmdir(task_dir);
+#endif
+            return false;
+        }
+        return true;
+    }
+    return set_error(error, error_size, "Unable to find an unused task ID.");
 }
 
 static int copy_path(char *dst, size_t dst_size, const char *src) {

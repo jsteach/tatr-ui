@@ -51,6 +51,19 @@ void tatr_tags_free(TatrTagDocs *docs);
 bool tatr_load_dir(TatrList *list, const char *dir);
 bool tatr_load_tag_docs(TatrTagDocs *docs, const char *dir);
 void tatr_sort(TatrList *list, bool by_id, bool ascending);
+bool tatr_save_task(const char *tasks_dir, const TatrTask *task,
+                    const char *title, const char *status,
+                    bool has_priority, int priority,
+                    const char *tags, const char *body,
+                    char *error, size_t error_size);
+bool tatr_create_task(const char *tasks_dir,
+                     const char *title, const char *status,
+                     bool has_priority, int priority,
+                     const char *tags, const char *body,
+                     char *created_id, size_t created_id_size,
+                     char *error, size_t error_size);
+bool tatr_create_tag(const char *tasks_dir, const char *name,
+                     char *error, size_t error_size);
 const char *tatr_find_tasks_dir(const char *explicit_dir, char *buf, size_t buflen);
 int tatr_get_current_dir(char *buf, size_t buflen);
 int tatr_status_is_closed(const TatrTask *t);

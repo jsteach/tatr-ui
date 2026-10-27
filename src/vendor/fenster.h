@@ -30,6 +30,8 @@ struct fenster {
   uint32_t **buf_ref;
   int keys[256]; /* keys are mostly ASCII, but arrows are 17..20 */
   int mod;       /* mod is 4 bits mask, ctrl=1, shift=2, alt=4, meta=8 */
+  char text_input[64];
+  int text_input_len;
   int x;
   int y;
   int mouse;
@@ -59,6 +61,46 @@ FENSTER_API int64_t fenster_time();
 
 #ifdef FENSTER_IMPL
 #ifndef FENSTER_HEADER
+static void fenster_push_text(struct fenster *f, const char *text, size_t size) {
+  if (!f || !text || size == 0)
+    return;
+  size_t available = sizeof(f->text_input) - 1 - (size_t)f->text_input_len;
+  if (size > available)
+    size = available;
+  if (!size)
+    return;
+  memcpy(f->text_input + f->text_input_len, text, size);
+  f->text_input_len += (int)size;
+  f->text_input[f->text_input_len] = 0;
+}
+
+static void fenster_push_codepoint(struct fenster *f, unsigned codepoint) {
+  char encoded[4];
+  size_t size;
+  if (codepoint < 0x80) {
+    encoded[0] = (char)codepoint;
+    size = 1;
+  } else if (codepoint < 0x800) {
+    encoded[0] = (char)(0xc0 | (codepoint >> 6));
+    encoded[1] = (char)(0x80 | (codepoint & 0x3f));
+    size = 2;
+  } else if (codepoint < 0x10000) {
+    encoded[0] = (char)(0xe0 | (codepoint >> 12));
+    encoded[1] = (char)(0x80 | ((codepoint >> 6) & 0x3f));
+    encoded[2] = (char)(0x80 | (codepoint & 0x3f));
+    size = 3;
+  } else if (codepoint <= 0x10ffff) {
+    encoded[0] = (char)(0xf0 | (codepoint >> 18));
+    encoded[1] = (char)(0x80 | ((codepoint >> 12) & 0x3f));
+    encoded[2] = (char)(0x80 | ((codepoint >> 6) & 0x3f));
+    encoded[3] = (char)(0x80 | (codepoint & 0x3f));
+    size = 4;
+  } else {
+    return;
+  }
+  fenster_push_text(f, encoded, size);
+}
+
 static int fenster_resize_framebuffer(struct fenster *f, int width, int height) {
   if (width <= 0 || height <= 0)
     return 0;
@@ -183,10 +225,20 @@ FENSTER_API int fenster_loop(struct fenster *f) {
     f->y = (int)(f->height - xy.y);
     return 0;
   }
-  case 10: /*NSEventTypeKeyDown*/
-  case 11: /*NSEventTypeKeyUp:*/ {
+  case 10: { /* NSEventTypeKeyDown */
+    id chars = msg(id, ev, "characters");
+    const char *utf8 = msg(const char *, chars, "UTF8String");
+    if (utf8 && !(f->mod & (1 | 4)))
+      fenster_push_text(f, utf8, strlen(utf8));
     NSUInteger k = msg(NSUInteger, ev, "keyCode");
-    f->keys[k < 127 ? FENSTER_KEYCODES[k] : 0] = evtype == 10;
+    f->keys[k < 127 ? FENSTER_KEYCODES[k] : 0] = 1;
+    NSUInteger mod = msg(NSUInteger, ev, "modifierFlags") >> 17;
+    f->mod = (mod & 0xc) | ((mod & 1) << 1) | ((mod >> 1) & 1);
+    return 0;
+  }
+  case 11: { /* NSEventTypeKeyUp */
+    NSUInteger k = msg(NSUInteger, ev, "keyCode");
+    f->keys[k < 127 ? FENSTER_KEYCODES[k] : 0] = 0;
     NSUInteger mod = msg(NSUInteger, ev, "modifierFlags") >> 17;
     f->mod = (mod & 0xc) | ((mod & 1) << 1) | ((mod >> 1) & 1);
     return 0;
@@ -246,6 +298,23 @@ static LRESULT CALLBACK fenster_wndproc(HWND hwnd, UINT msg, WPARAM wParam,
              (((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) >> 12);
     f->keys[FENSTER_KEYCODES[HIWORD(lParam) & 0x1ff]] = !((lParam >> 31) & 1);
   } break;
+  case WM_CHAR: {
+    static unsigned high_surrogate;
+    unsigned value = (unsigned)wParam;
+    if (value >= 0xd800 && value <= 0xdbff) {
+      high_surrogate = value;
+    } else if (value >= 0xdc00 && value <= 0xdfff && high_surrogate) {
+      unsigned codepoint = 0x10000 +
+          ((high_surrogate - 0xd800) << 10) + (value - 0xdc00);
+      high_surrogate = 0;
+      fenster_push_codepoint(f, codepoint);
+    } else if (value >= 0x20 && value != 0x7f) {
+      high_surrogate = 0;
+      fenster_push_codepoint(f, value);
+    } else {
+      high_surrogate = 0;
+    }
+  } break;
   case WM_DESTROY:
     PostQuitMessage(0);
     break;
@@ -298,6 +367,8 @@ FENSTER_API void fenster_close(struct fenster *f) {
 }
 
 FENSTER_API int fenster_loop(struct fenster *f) {
+  f->text_input_len = 0;
+  f->text_input[0] = 0;
   MSG msg;
   while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
     if (msg.message == WM_QUIT)
@@ -346,6 +417,8 @@ FENSTER_API void fenster_close(struct fenster *f) {
 FENSTER_API int fenster_loop(struct fenster *f) {
   if (!f->img)
     return -1;
+  f->text_input_len = 0;
+  f->text_input[0] = 0;
   XEvent ev;
   XPutImage(f->dpy, f->w, f->gc, f->img, 0, 0, 0, 0, f->width, f->height);
   XFlush(f->dpy);
@@ -385,6 +458,12 @@ FENSTER_API int fenster_loop(struct fenster *f) {
           f->keys[FENSTER_KEYCODES[i + 1]] = (ev.type == KeyPress);
           break;
         }
+      }
+      if (ev.type == KeyPress && !(m & (ControlMask | Mod1Mask))) {
+        char input[16];
+        KeySym key;
+        int input_len = XLookupString(&ev.xkey, input, sizeof(input), &key, NULL);
+        if (input_len > 0) fenster_push_text(f, input, (size_t)input_len);
       }
       f->mod = (!!(m & ControlMask)) | (!!(m & ShiftMask) << 1) |
                (!!(m & Mod1Mask) << 2) | (!!(m & Mod4Mask) << 3);

@@ -6,10 +6,12 @@ SOURCES = src/main.c src/tatr.c src/ui.c src/renderer.c src/vendor/lite/rencache
 TINYFD_OBJECT = build/tinyfiledialogs.o
 TARGET = build/tatr-ui
 TEST_TARGET = build/test-tatr-sort
+WRITE_TEST_TARGET = build/test-tatr-write
 
 ifeq ($(OS),Windows_NT)
 TARGET := build/tatr-ui.exe
 TEST_TARGET := build/test-tatr-sort.exe
+WRITE_TEST_TARGET := build/test-tatr-write.exe
 PLATFORM_LIBS = -lgdi32 -luser32 -lcomdlg32 -lole32 -lm
 else ifeq ($(shell uname -s),Darwin)
 PLATFORM_LIBS = -framework Cocoa -framework CoreGraphics -lm
@@ -41,8 +43,13 @@ $(TEST_TARGET): tests/test_tatr_sort.c src/tatr.c src/tatr.h \
 	mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_tatr_sort.c src/tatr.c -o $@
 
-test: $(TEST_TARGET)
+$(WRITE_TEST_TARGET): tests/test_tatr_write.c src/tatr.c src/tatr.h
+	mkdir -p build
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_tatr_write.c src/tatr.c -o $@
+
+test: $(TEST_TARGET) $(WRITE_TEST_TARGET)
 	$(TEST_TARGET)
+	$(WRITE_TEST_TARGET)
 
 clean:
 	rm -rf build

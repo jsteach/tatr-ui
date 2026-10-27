@@ -15,6 +15,8 @@
 #define INITIAL_WINDOW_WIDTH 1200
 #define INITIAL_WINDOW_HEIGHT 780
 #define ROW_H 68
+#define RECENT_PROJECT_LIMIT 10
+#define PROJECT_PATH_CAPACITY 4096
 
 typedef enum {
     FILTER_ALL,
@@ -62,9 +64,13 @@ typedef struct {
     char task_id[64];
     char title[512];
     size_t title_cursor;
+    size_t title_anchor;
+    int text_dragging;
+    int text_drag_field;
     char status[8];
     char priority[32];
     size_t priority_cursor;
+    size_t priority_anchor;
     char tags[512];
     int tags_open;
     size_t tag_scroll;
@@ -72,14 +78,27 @@ typedef struct {
     int creating_tag;
     char new_tag[64];
     size_t new_tag_cursor;
+    size_t new_tag_anchor;
     char *body;
     size_t body_len;
     size_t body_cursor;
+    size_t body_anchor;
+    int body_vertical_x;
+    int body_vertical_x_valid;
     size_t body_capacity;
     char message[160];
 } EditForm;
 
+typedef struct {
+    char paths[RECENT_PROJECT_LIMIT][PROJECT_PATH_CAPACITY];
+    size_t count;
+    size_t selected;
+    int menu_open;
+    char error[160];
+} RecentProjects;
+
 static RenFont *ui_font;
+static int text_prefix_width(const char *text, size_t length);
 
 static int clamp_int(int value, int low, int high) {
     if (value < low) return low;
@@ -142,18 +161,213 @@ static int project_button_width(const UiLayout *layout) {
     return clamp_int(layout->width / 5, 90, 132);
 }
 
-static RenRect welcome_button_rect(const UiLayout *layout) {
-    int width = clamp_int(layout->width / 3, 1, 210);
-    if (width > layout->width - 2 * layout->margin)
-        width = layout->width - 2 * layout->margin;
+static RenRect welcome_card_rect(const UiLayout *layout, size_t recent_count) {
+    int width = layout->width - 2 * layout->margin;
+    if (width > 640) width = 640;
     if (width < 1) width = 1;
-    int height = 40;
-    return (RenRect){
-        (layout->width - width) / 2,
-        layout->height / 2 + 42,
-        width,
-        height
-    };
+    int height = recent_count ? 218 + (int)recent_count * 32 : 210;
+    if (height > layout->height - 2 * layout->margin)
+        height = layout->height - 2 * layout->margin;
+    if (height < 1) height = 1;
+    int x = (layout->width - width) / 2;
+    int y = (layout->height - height) / 2;
+    return (RenRect){x, y, width, height};
+}
+
+static RenRect welcome_button_rect(const UiLayout *layout, size_t recent_count) {
+    RenRect card = welcome_card_rect(layout, recent_count);
+    int width = clamp_int(card.width / 2, 1, 210);
+    int height = 36;
+    return (RenRect){card.x + (card.width - width) / 2,
+                     card.y + 142, width, height};
+}
+
+static RenRect welcome_recent_row(const UiLayout *layout, size_t recent_count,
+                                  size_t index) {
+    RenRect card = welcome_card_rect(layout, recent_count);
+    int height = 32;
+    return (RenRect){card.x + 24, card.y + 206 + (int)index * height,
+                     card.width - 48, height};
+}
+
+static int recent_history_path(char *path, size_t capacity) {
+#ifdef _WIN32
+    const char *home = getenv("USERPROFILE");
+    const char *separator = "\\";
+#else
+    const char *home = getenv("HOME");
+    const char *separator = "/";
+#endif
+    if (!home || !*home) return 0;
+    int written = snprintf(path, capacity, "%s%s.tatr-ui-history",
+                           home, separator);
+    return written >= 0 && (size_t)written < capacity;
+}
+
+static void recent_projects_load(RecentProjects *recent) {
+    char path[PROJECT_PATH_CAPACITY];
+    if (!recent_history_path(path, sizeof(path))) {
+        snprintf(recent->error, sizeof(recent->error),
+                 "Could not determine the user home folder for project history.");
+        return;
+    }
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        if (errno != ENOENT)
+            snprintf(recent->error, sizeof(recent->error),
+                     "Could not open the recent-project history file.");
+        return;
+    }
+    char line[PROJECT_PATH_CAPACITY];
+    while (recent->count < RECENT_PROJECT_LIMIT &&
+           fgets(line, sizeof(line), file)) {
+        size_t length = strlen(line);
+        while (length && (line[length - 1] == '\n' ||
+                          line[length - 1] == '\r'))
+            line[--length] = 0;
+        if (!length || length >= sizeof(recent->paths[0])) continue;
+        int duplicate = 0;
+        for (size_t i = 0; i < recent->count; ++i) {
+#ifdef _WIN32
+            if (_stricmp(recent->paths[i], line) == 0) duplicate = 1;
+#else
+            if (strcmp(recent->paths[i], line) == 0) duplicate = 1;
+#endif
+        }
+        if (!duplicate)
+            memcpy(recent->paths[recent->count++], line, length + 1);
+    }
+    if (ferror(file))
+        snprintf(recent->error, sizeof(recent->error),
+                 "Could not read the recent-project history file.");
+    if (fclose(file) != 0 && !recent->error[0])
+        snprintf(recent->error, sizeof(recent->error),
+                 "Could not close the recent-project history file.");
+}
+
+static int recent_projects_save(const RecentProjects *recent) {
+    char path[PROJECT_PATH_CAPACITY];
+    char temp_path[PROJECT_PATH_CAPACITY + 8];
+    if (!recent_history_path(path, sizeof(path))) return 0;
+    int written = snprintf(temp_path, sizeof(temp_path), "%s.tmp", path);
+    if (written < 0 || (size_t)written >= sizeof(temp_path)) return 0;
+    FILE *file = fopen(temp_path, "wb");
+    if (!file) return 0;
+    int failed = 0;
+    for (size_t i = 0; i < recent->count; ++i) {
+        if (fprintf(file, "%s\n", recent->paths[i]) < 0) {
+            failed = 1;
+            break;
+        }
+    }
+    if (fflush(file) != 0 || ferror(file)) failed = 1;
+    if (fclose(file) != 0) failed = 1;
+    if (failed) {
+        remove(temp_path);
+        return 0;
+    }
+#ifdef _WIN32
+    if (!MoveFileExA(temp_path, path,
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+#else
+    if (rename(temp_path, path) != 0) {
+#endif
+        remove(temp_path);
+        return 0;
+    }
+    return 1;
+}
+
+static void recent_projects_add(RecentProjects *recent, const char *path) {
+    size_t path_len = strlen(path);
+    if (!path_len || path_len >= sizeof(recent->paths[0]) ||
+        strchr(path, '\n') || strchr(path, '\r')) {
+        snprintf(recent->error, sizeof(recent->error),
+                 "Project path cannot be stored in the history file.");
+        return;
+    }
+    size_t index = recent->count;
+    for (size_t i = 0; i < recent->count; ++i) {
+#ifdef _WIN32
+        if (_stricmp(recent->paths[i], path) == 0) {
+#else
+        if (strcmp(recent->paths[i], path) == 0) {
+#endif
+            index = i;
+            break;
+        }
+    }
+    if (index == recent->count && recent->count == RECENT_PROJECT_LIMIT)
+        --recent->count;
+    if (index < recent->count) {
+        for (size_t i = index; i > 0; --i)
+            memcpy(recent->paths[i], recent->paths[i - 1],
+                   sizeof(recent->paths[i]));
+    } else {
+        for (size_t i = recent->count; i > 0; --i)
+            memcpy(recent->paths[i], recent->paths[i - 1],
+                   sizeof(recent->paths[i]));
+        ++recent->count;
+    }
+    snprintf(recent->paths[0], sizeof(recent->paths[0]), "%s", path);
+    recent->error[0] = 0;
+    if (!recent_projects_save(recent))
+        snprintf(recent->error, sizeof(recent->error),
+                 "Could not save project history in the user home folder.");
+}
+
+static int project_root_from_tasks(const char *tasks_dir, char *root,
+                                   size_t root_size) {
+    size_t length = strlen(tasks_dir);
+    while (length > 1 && (tasks_dir[length - 1] == '/' ||
+                          tasks_dir[length - 1] == '\\'))
+        --length;
+    const char *base = tasks_dir + length;
+    while (base > tasks_dir && base[-1] != '/' && base[-1] != '\\') --base;
+    if ((size_t)((tasks_dir + length) - base) != 5) return 0;
+    size_t root_len = (size_t)(base - tasks_dir);
+    while (root_len > 1 && (tasks_dir[root_len - 1] == '/' ||
+                            tasks_dir[root_len - 1] == '\\'))
+        --root_len;
+    if (root_len == 2 && tasks_dir[1] == ':') root_len = 3;
+    if (root_len + 1 > root_size) return 0;
+    memcpy(root, tasks_dir, root_len);
+    if (root_len == 3 && tasks_dir[1] == ':')
+        root[2] = '\\';
+    root[root_len] = 0;
+    return 1;
+}
+
+static int make_project_path_absolute(const char *path, char *absolute,
+                                      size_t absolute_size) {
+    int rooted = path[0] == '/' || path[0] == '\\';
+#ifdef _WIN32
+    rooted = rooted ||
+        (strlen(path) >= 3 && path[1] == ':' &&
+         (path[2] == '/' || path[2] == '\\'));
+#endif
+    if (rooted) {
+        size_t length = strlen(path);
+        if (length >= absolute_size) return 0;
+        memcpy(absolute, path, length + 1);
+        return 1;
+    }
+
+    char current[PROJECT_PATH_CAPACITY];
+    if (!tatr_get_current_dir(current, sizeof(current))) return 0;
+    size_t current_len = strlen(current);
+    int separator = current_len > 0 && current[current_len - 1] != '/' &&
+                    current[current_len - 1] != '\\';
+    int written = snprintf(absolute, absolute_size, "%s%s%s", current,
+                           separator ? "\\" : "", path);
+#ifndef _WIN32
+    if (separator && written > 0 && (size_t)written < absolute_size) {
+        char *insert = absolute + current_len;
+        memmove(insert + 1, insert, strlen(insert) + 1);
+        *insert = '/';
+    }
+#endif
+    return written >= 0 && (size_t)written < absolute_size;
 }
 
 static RenColor rgb(unsigned char r, unsigned char g, unsigned char b) {
@@ -284,6 +498,9 @@ static int edit_form_open(EditForm *form, const TatrTask *task) {
     }
     memcpy(form->body, body, form->body_len + 1);
     form->body_cursor = form->body_len;
+    form->body_anchor = form->body_cursor;
+    form->title_anchor = form->title_cursor;
+    form->priority_anchor = form->priority_cursor;
     return 1;
 }
 
@@ -353,15 +570,212 @@ static size_t delete_previous_character(char *text, size_t *length,
     return start;
 }
 
+static void selection_bounds(size_t cursor, size_t anchor,
+                             size_t *start, size_t *end) {
+    *start = cursor < anchor ? cursor : anchor;
+    *end = cursor > anchor ? cursor : anchor;
+}
+
+static void delete_selection(char *text, size_t *length, size_t *cursor,
+                             size_t *anchor) {
+    size_t start;
+    size_t end;
+    selection_bounds(*cursor, *anchor, &start, &end);
+    if (start == end) return;
+    memmove(text + start, text + end, *length - end + 1);
+    *length -= end - start;
+    *cursor = start;
+    *anchor = start;
+}
+
 static int insert_text(char *value, size_t capacity, size_t *length,
-                       size_t *cursor, const char *input, size_t input_len) {
-    if (*cursor > *length || input_len >= capacity - *length) return 0;
-    memmove(value + *cursor + input_len, value + *cursor,
-            *length - *cursor + 1);
-    memcpy(value + *cursor, input, input_len);
-    *length += input_len;
-    *cursor += input_len;
+                       size_t *cursor, size_t *anchor, const char *input,
+                       size_t input_len) {
+    size_t start;
+    size_t end;
+    selection_bounds(*cursor, *anchor, &start, &end);
+    size_t removed = end - start;
+    if (start > *length || removed > *length ||
+        input_len >= capacity - (*length - removed))
+        return 0;
+    memmove(value + start + input_len, value + end, *length - end + 1);
+    memcpy(value + start, input, input_len);
+    *length = *length - removed + input_len;
+    *cursor = start + input_len;
+    *anchor = *cursor;
     return 1;
+}
+
+static size_t cursor_x(const char *text, size_t line_start, size_t cursor) {
+    char prefix[PROJECT_PATH_CAPACITY];
+    if (cursor < line_start || cursor - line_start >= sizeof(prefix)) return 0;
+    size_t length = cursor - line_start;
+    memcpy(prefix, text + line_start, length);
+    prefix[length] = 0;
+    return (size_t)ren_get_font_width(ui_font, prefix);
+}
+
+static int text_prefix_width(const char *text, size_t length) {
+    char prefix[PROJECT_PATH_CAPACITY];
+    if (length >= sizeof(prefix)) length = sizeof(prefix) - 1;
+    memcpy(prefix, text, length);
+    prefix[length] = 0;
+    return ren_get_font_width(ui_font, prefix);
+}
+
+static size_t body_cursor_from_x(const char *text, size_t length,
+                                 size_t line_start, int target_x) {
+    size_t cursor = line_start;
+    while (cursor < length && text[cursor] != '\n') {
+        size_t next = utf8_next(text, length, cursor);
+        size_t x0 = cursor_x(text, line_start, cursor);
+        size_t x1 = cursor_x(text, line_start, next);
+        if ((size_t)target_x <= x1)
+            return (size_t)target_x - x0 < x1 - (size_t)target_x
+                ? cursor : next;
+        cursor = next;
+    }
+    return cursor;
+}
+
+static void wrapped_line(const char *value, size_t length, size_t start,
+                         int max_width, size_t *end, size_t *next_start) {
+    if (start >= length) {
+        *end = *next_start = length;
+        return;
+    }
+    if (value[start] == '\n') {
+        *end = start;
+        *next_start = start + 1;
+        return;
+    }
+    char line[PROJECT_PATH_CAPACITY];
+    size_t used = 0;
+    size_t scan = start;
+    size_t last_space = SIZE_MAX;
+    while (scan < length && value[scan] != '\n' &&
+           used + 4 < sizeof(line)) {
+        size_t next = utf8_next(value, length, scan);
+        size_t char_len = next - scan;
+        memcpy(line + used, value + scan, char_len);
+        used += char_len;
+        line[used] = 0;
+        if (value[scan] == ' ') last_space = scan;
+        scan = next;
+        if (ren_get_font_width(ui_font, line) > max_width) {
+            if (last_space != SIZE_MAX && last_space > start) {
+                *end = last_space;
+                scan = last_space + 1;
+                while (scan < length && value[scan] == ' ') ++scan;
+            } else {
+                *end = scan == next && scan > start
+                    ? utf8_previous(value, scan) : start;
+                if (*end == start) scan = next;
+            }
+            *next_start = scan;
+            return;
+        }
+    }
+    *end = scan;
+    *next_start = scan < length && value[scan] == '\n' ? scan + 1 : scan;
+}
+
+static size_t vertical_cursor(const char *text, size_t length, size_t cursor,
+                              int direction, int target_x, int max_width) {
+    size_t current_start = 0;
+    size_t next_start = 0;
+    size_t previous_start = 0;
+    size_t previous_end = 0;
+    size_t scan = 0;
+    int found = 0;
+    while (scan <= length) {
+        size_t line_end;
+        size_t next;
+        wrapped_line(text, length, scan, max_width, &line_end, &next);
+        if (cursor >= scan && cursor <= line_end) {
+            current_start = scan;
+            next_start = next;
+            found = 1;
+            break;
+        }
+        previous_start = scan;
+        previous_end = line_end;
+        if (next <= scan) break;
+        scan = next;
+    }
+    if (!found) return cursor;
+
+    size_t target_start;
+    size_t target_end;
+    if (direction < 0) {
+        if (!current_start) return cursor;
+        target_start = previous_start;
+        target_end = previous_end;
+    } else {
+        if (next_start >= length) return cursor;
+        target_start = next_start;
+        wrapped_line(text, length, target_start, max_width,
+                     &target_end, &next_start);
+    }
+    return body_cursor_from_x(text, target_end, target_start, target_x);
+}
+
+static size_t visual_line_start(const char *text, size_t length,
+                                size_t cursor, int max_width) {
+    size_t scan = 0;
+    while (scan < length) {
+        size_t end;
+        size_t next;
+        wrapped_line(text, length, scan, max_width, &end, &next);
+        if (cursor <= end || next <= scan) return scan;
+        scan = next;
+    }
+    return scan;
+}
+
+static size_t body_cursor_at_point(const char *text, size_t length, int x,
+                                   int y, int start_x, int start_y,
+                                   int max_width) {
+    int line_height = ren_get_font_height(ui_font) + 7;
+    size_t row = y > start_y ? (size_t)((y - start_y) / line_height) : 0;
+    size_t line_start = 0;
+    for (size_t i = 0; i < row && line_start < length; ++i) {
+        size_t end;
+        size_t next;
+        wrapped_line(text, length, line_start, max_width, &end, &next);
+        (void)end;
+        if (next <= line_start) break;
+        line_start = next;
+    }
+    size_t end;
+    size_t next;
+    wrapped_line(text, length, line_start, max_width, &end, &next);
+    (void)next;
+    return body_cursor_from_x(text, end, line_start,
+                              x > start_x ? x - start_x : 0);
+}
+
+static void set_cursor_anchor(size_t *cursor, size_t *anchor, int extend) {
+    if (!extend) *anchor = *cursor;
+}
+
+static size_t text_cursor_from_point(const char *value, int x, int start_x) {
+    size_t length = strlen(value);
+    size_t cursor = 0;
+    int target = x > start_x ? x - start_x : 0;
+    while (cursor < length) {
+        size_t next = utf8_next(value, length, cursor);
+        int previous_width = text_prefix_width(value, cursor);
+        int current_width = text_prefix_width(value, next);
+        if (target <= previous_width +
+                (current_width - previous_width) / 2)
+            return cursor;
+        if (target <= current_width +
+                (current_width - previous_width) / 2)
+            return next;
+        cursor = next;
+    }
+    return length;
 }
 
 static int form_append_body(EditForm *form, const char *input, size_t input_len) {
@@ -381,14 +795,9 @@ static int form_append_body(EditForm *form, const char *input, size_t input_len)
         form->body = body;
         form->body_capacity = capacity;
     }
-    if (form->body_cursor > form->body_len) return 0;
-    memmove(form->body + form->body_cursor + input_len,
-            form->body + form->body_cursor,
-            form->body_len - form->body_cursor + 1);
-    memcpy(form->body + form->body_cursor, input, input_len);
-    form->body_len += input_len;
-    form->body_cursor += input_len;
-    return 1;
+    return insert_text(form->body, form->body_capacity, &form->body_len,
+                       &form->body_cursor, &form->body_anchor, input,
+                       input_len);
 }
 
 static int tag_is_selected(const EditForm *form, const char *name) {
@@ -497,8 +906,11 @@ static void draw_button(const char *label, int x, int y, int width, int active) 
     text(label, x + 10, y + 7, foreground);
 }
 
+static int text_prefix_width(const char *text, size_t length);
+
 static void draw_wrapped_cursor(const char *value, int x, int y, int width,
-                                int bottom, size_t cursor, int show_cursor) {
+                                int bottom, size_t cursor, size_t anchor,
+                                int show_cursor) {
     if (!value) value = "";
     size_t text_len = strlen(value);
     int line_height = ren_get_font_height(ui_font) + 7;
@@ -540,6 +952,20 @@ static void draw_wrapped_cursor(const char *value, int x, int y, int width,
         if (next_offset < text_len && value[next_offset] == '\n') ++next_offset;
         while (used && line[used - 1] == ' ') --used;
         line[used] = 0;
+        size_t selection_start;
+        size_t selection_end;
+        selection_bounds(cursor, anchor, &selection_start, &selection_end);
+        size_t selected_start = selection_start > start ? selection_start : start;
+        size_t selected_end = selection_end < start + used
+            ? selection_end : start + used;
+        if (selected_start < selected_end) {
+            int left = x + text_prefix_width(line, selected_start - start);
+            int selected_width =
+                text_prefix_width(line + (selected_start - start),
+                                  selected_end - selected_start);
+            rect(left, y + 1, selected_width, line_height - 3,
+                 rgb(56, 92, 126));
+        }
         text(line, x, y, rgb(185, 197, 213));
         int cursor_at_final_end =
             cursor == text_len && next_offset == text_len &&
@@ -567,7 +993,7 @@ static void draw_wrapped_cursor(const char *value, int x, int y, int width,
 }
 
 static void draw_wrapped(const char *value, int x, int y, int width, int bottom) {
-    draw_wrapped_cursor(value, x, y, width, bottom, 0, 0);
+    draw_wrapped_cursor(value, x, y, width, bottom, 0, 0, 0);
 }
 typedef struct {
     int x;
@@ -646,26 +1072,29 @@ static TagMenuLayout make_tag_menu_layout(const FormLayout *form,
 }
 
 static void draw_form_field(const char *label, const char *value,
-                            size_t cursor, int x, int label_y, int width,
-                            int focused) {
+                            size_t cursor, size_t anchor, int x, int label_y,
+                            int width, int focused, const UiLayout *layout) {
     text(label, x, label_y, rgb(160, 174, 192));
     rect(x, label_y + 20, width, 34,
          focused ? rgb(39, 57, 75) : rgb(29, 37, 49));
     rect(x, label_y + 20, width, 1,
          focused ? rgb(93, 164, 205) : rgb(51, 62, 78));
-    char shown[1024];
-    fit_text(value, width - 18, shown, sizeof(shown));
-    text(shown, x + 9, label_y + 29, rgb(222, 231, 242));
-    if (focused) {
-        size_t visible_cursor = cursor < strlen(shown) ? cursor : strlen(shown);
-        char prefix[sizeof(shown)];
-        memcpy(prefix, shown, visible_cursor);
-        prefix[visible_cursor] = 0;
-        int cursor_x = x + 9 + ren_get_font_width(ui_font, prefix);
-        int right = x + width - 6;
-        if (cursor_x > right) cursor_x = right;
-        rect(cursor_x, label_y + 25, 1, 21, rgb(225, 235, 246));
+    size_t start;
+    size_t end;
+    selection_bounds(cursor, anchor, &start, &end);
+    rencache_set_clip_rect((RenRect){x + 5, label_y + 20, width - 10, 34});
+    if (focused && start != end) {
+        int selection_x = x + 9 + text_prefix_width(value, start);
+        int selection_width = text_prefix_width(value + start, end - start);
+        rect(selection_x, label_y + 25, selection_width, 21,
+             rgb(56, 92, 126));
     }
+    text(value, x + 9, label_y + 29, rgb(222, 231, 242));
+    if (focused) {
+        int caret_x = x + 9 + text_prefix_width(value, cursor);
+        rect(caret_x, label_y + 25, 1, 21, rgb(225, 235, 246));
+    }
+    rencache_set_clip_rect((RenRect){0, 0, layout->width, layout->height});
 }
 
 static void draw_tag_menu(const EditForm *form, const TatrTagDocs *tags,
@@ -721,14 +1150,62 @@ static void draw_tag_creator(const EditForm *form, const FormLayout *pos) {
     text("Tag names cannot contain spaces or commas.", x + 20, y + 46,
          rgb(145, 163, 183));
     rect(x + 20, y + 72, width - 40, 36, rgb(39, 57, 75));
+    size_t selection_start;
+    size_t selection_end;
+    selection_bounds(form->new_tag_cursor, form->new_tag_anchor,
+                     &selection_start, &selection_end);
+    if (selection_start != selection_end) {
+        int selected_x = x + 30 +
+            text_prefix_width(form->new_tag, selection_start);
+        int selected_width = text_prefix_width(form->new_tag + selection_start,
+                                               selection_end - selection_start);
+        rect(selected_x, y + 79, selected_width, 22, rgb(56, 92, 126));
+    }
     text(form->new_tag, x + 30, y + 82, rgb(222, 231, 242));
-    int caret_x = x + 30 + ren_get_font_width(ui_font, form->new_tag);
+    int caret_x = x + 30 +
+                  text_prefix_width(form->new_tag, form->new_tag_cursor);
     if (caret_x > x + width - 26) caret_x = x + width - 26;
     rect(caret_x, y + 79, 1, 22, rgb(225, 235, 246));
     if (form->message[0])
         text(form->message, x + 20, y + 116, rgb(239, 145, 120));
     draw_button("Create", x + width - 228, y + 132, 96, 1);
     draw_button("Cancel", x + width - 120, y + 132, 96, 0);
+}
+
+static void draw_recent_menu(const RecentProjects *recent,
+                             const UiLayout *layout) {
+    rect(0, 0, layout->width, layout->height, rgb(7, 9, 13));
+    int width = layout->width - 2 * layout->margin;
+    if (width > 640) width = 640;
+    if (width < 1) width = 1;
+    int row_height = 36;
+    int height = 82 + (int)(recent->count ? recent->count : 1) * row_height;
+    if (height > layout->height - 2 * layout->margin)
+        height = layout->height - 2 * layout->margin;
+    int x = (layout->width - width) / 2;
+    int y = (layout->height - height) / 2;
+    rect(x, y, width, height, rgb(22, 27, 36));
+    text("Recent projects", x + 20, y + 18, rgb(235, 241, 249));
+    text("Escape or click outside to close.", x + 20, y + 38,
+         rgb(130, 148, 170));
+    if (!recent->count) {
+        text("No recent projects.", x + 20, y + 68, rgb(145, 163, 183));
+    } else {
+        for (size_t i = 0; i < recent->count; ++i) {
+            int row_y = y + 62 + (int)i * row_height;
+            if (i == recent->selected)
+                rect(x + 8, row_y, width - 16, row_height,
+                     rgb(39, 57, 75));
+            char shown[PROJECT_PATH_CAPACITY];
+            fit_text(recent->paths[i], width - 36, shown, sizeof(shown));
+            text(shown, x + 18, row_y + 9, rgb(220, 229, 239));
+        }
+    }
+    if (recent->error[0]) {
+        char shown[160];
+        fit_text(recent->error, width - 36, shown, sizeof(shown));
+        text(shown, x + 18, y + height - 19, rgb(239, 145, 120));
+    }
 }
 
 static void draw_edit_form(const EditForm *form, const TatrTagDocs *tags,
@@ -742,8 +1219,9 @@ static void draw_edit_form(const EditForm *form, const TatrTagDocs *tags,
          pos.y + 51, rgb(130, 148, 170));
 
     draw_form_field("Title", form->title, form->title_cursor,
+                    form->title_anchor,
                     pos.x + 24, pos.y + 64,
-                    pos.width - 48, form->focused == 0);
+                    pos.width - 48, form->focused == 0, layout);
 
     text("Status", pos.status_x, pos.status_y - 4, rgb(160, 174, 192));
     rect(pos.status_x, pos.status_y + 16, pos.status_width, 34,
@@ -753,9 +1231,9 @@ static void draw_edit_form(const EditForm *form, const TatrTagDocs *tags,
              ? rgb(155, 168, 185) : rgb(91, 190, 151));
 
     draw_form_field("Priority (number, blank for unset)", form->priority,
-                    form->priority_cursor,
-                    pos.priority_x, pos.priority_y - 24,
-                    pos.priority_width, form->focused == 2);
+                    form->priority_cursor, form->priority_anchor,
+                    pos.priority_x, pos.priority_y - 4,
+                    pos.priority_width, form->focused == 2, layout);
     text("Tags (select one or more)", pos.x + 24, pos.tags_y - 20,
          rgb(160, 174, 192));
     rect(pos.x + 24, pos.tags_y, pos.width - 48, 34,
@@ -778,6 +1256,8 @@ static void draw_edit_form(const EditForm *form, const TatrTagDocs *tags,
     draw_wrapped_cursor(form->body, pos.x + 34, pos.body_y + 8,
                         pos.width - 68, pos.body_y + pos.body_height - 4,
                         form->body_cursor,
+                        form->focused == 4 ? form->body_anchor
+                                           : form->body_cursor,
                         form->focused == 4 &&
                             ((fenster_time() / 500) % 2 == 0));
     rencache_set_clip_rect((RenRect){0, 0, layout->width, layout->height});
@@ -972,7 +1452,8 @@ static void draw_details(const TatrList *list, const TatrTask *task,
 
 static void draw_ui(const TatrList *list, const TatrTagDocs *tags,
                     const char *tasks_dir, UiState *state,
-                    EditForm *form, const UiLayout *layout) {
+                    EditForm *form, const RecentProjects *recent,
+                    const UiLayout *layout) {
     if (form->active) {
         rencache_begin_frame();
         draw_edit_form(form, tags, layout);
@@ -985,25 +1466,36 @@ static void draw_ui(const TatrList *list, const TatrTagDocs *tags,
         rect(0, 0, layout->width, layout->height, rgb(15, 19, 26));
         text("TATR", 26, 22, rgb(234, 241, 250));
 
-        int card_width = layout->width - 2 * layout->margin;
-        if (card_width > 560) card_width = 560;
-        if (card_width < 1) card_width = 1;
-        int card_height = 230;
-        int card_x = (layout->width - card_width) / 2;
-        int card_y = (layout->height - card_height) / 2;
-        rect(card_x, card_y, card_width, card_height, rgb(22, 27, 36));
-        text("Welcome to TATR", card_x + 28, card_y + 32,
+        RenRect card = welcome_card_rect(layout, recent->count);
+        rect(card.x, card.y, card.width, card.height, rgb(22, 27, 36));
+        text("Welcome to TATR", card.x + 28, card.y + 32,
              rgb(235, 241, 249));
         text("Open a project folder to browse its tasks.",
-             card_x + 28, card_y + 76, rgb(160, 174, 192));
+             card.x + 28, card.y + 76, rgb(160, 174, 192));
         text("Choose either the project root or its tasks folder.",
-             card_x + 28, card_y + 106, rgb(130, 148, 170));
+             card.x + 28, card.y + 106, rgb(130, 148, 170));
 
-        RenRect button = welcome_button_rect(layout);
+        RenRect button = welcome_button_rect(layout, recent->count);
         rect(button.x, button.y, button.width, button.height,
              rgb(46, 80, 105));
-        text("Choose project folder", button.x + 17, button.y + 11,
+        text("Choose project folder", button.x + 17, button.y + 9,
              rgb(220, 241, 255));
+        if (recent->count) {
+            text("Recent projects", card.x + 24, card.y + 184,
+                 rgb(160, 174, 192));
+            for (size_t i = 0; i < recent->count; ++i) {
+                RenRect row = welcome_recent_row(layout, recent->count, i);
+                rect(row.x, row.y, row.width, row.height,
+                     rgb(29, 37, 49));
+                char shown[PROJECT_PATH_CAPACITY];
+                fit_text(recent->paths[i], row.width - 18,
+                         shown, sizeof(shown));
+                text(shown, row.x + 10, row.y + 8, rgb(220, 229, 239));
+            }
+        }
+        if (recent->error[0])
+            text(recent->error, card.x + 24, card.y + card.height - 18,
+                 rgb(239, 145, 120));
         rencache_end_frame();
         return;
     }
@@ -1018,6 +1510,8 @@ static void draw_ui(const TatrList *list, const TatrTagDocs *tags,
     int project_button_w = project_button_width(layout);
     int project_button_x = layout->width - layout->margin - project_button_w;
     int new_button_x = project_button_x - 112;
+    int recent_button_x = new_button_x - 108;
+    draw_button("Recent", recent_button_x, 18, 96, 0);
     draw_button("New task", new_button_x, 18, 100, 0);
     draw_button(project_button_w >= 120 ? "Open project" : "Project",
                 project_button_x, 18, project_button_w, 0);
@@ -1025,49 +1519,62 @@ static void draw_ui(const TatrList *list, const TatrTagDocs *tags,
     snprintf(subtitle, sizeof(subtitle), "%zu task%s  |  %s",
              list->count, list->count == 1 ? "" : "s", tasks_dir);
     char fitted[320];
-    fit_text(subtitle, new_button_x - 132, fitted, sizeof(fitted));
+    fit_text(subtitle, recent_button_x - 132, fitted, sizeof(fitted));
     text(fitted, 114, 27, rgb(130, 148, 170));
 
     draw_list(list, state, count, layout);
     draw_details(list, selected, tags, layout);
+    if (recent->menu_open) draw_recent_menu(recent, layout);
+    if (recent->error[0])
+        text(recent->error, 114, layout->height - 24, rgb(239, 145, 120));
     rencache_end_frame();
 }
 
-static void show_project_error(const char *message) {
-    tinyfd_messageBox("TATR", message, "ok", "error", 1);
-}
-
-static void choose_project(TatrList *list, TatrTagDocs *tags,
-                           char *tasks_dir, size_t tasks_dir_size,
-                           UiState *state) {
-    char *selected = tinyfd_selectFolderDialog("Choose a TATR project folder",
-                                                NULL);
-    if (!selected) return;
-
+static int open_project_path(TatrList *list, TatrTagDocs *tags,
+                             char *tasks_dir, size_t tasks_dir_size,
+                             UiState *state, RecentProjects *recent,
+                             const char *selected) {
     char new_tasks_dir[4096];
     const char *resolved = tatr_find_tasks_dir(selected, new_tasks_dir,
                                                 sizeof(new_tasks_dir));
     if (!resolved) {
-        show_project_error("The selected folder has no tasks directory.");
-        return;
+        snprintf(recent->error, sizeof(recent->error),
+                 "This recent folder no longer has a tasks directory.");
+        return 0;
     }
     if (strlen(new_tasks_dir) >= tasks_dir_size) {
-        show_project_error("The selected tasks directory path is too long.");
-        return;
+        snprintf(recent->error, sizeof(recent->error),
+                 "The selected tasks directory path is too long.");
+        return 0;
     }
 
     TatrList new_list = {0};
     TatrTagDocs new_tags = {0};
     if (!tatr_load_dir(&new_list, new_tasks_dir)) {
-        show_project_error("Unable to read tasks from the selected project.");
+        snprintf(recent->error, sizeof(recent->error),
+                 "Unable to read tasks from the selected project.");
         tatr_list_free(&new_list);
-        return;
+        return 0;
     }
     if (!tatr_load_tag_docs(&new_tags, new_tasks_dir)) {
-        show_project_error("Unable to read tag documentation from the selected project.");
+        snprintf(recent->error, sizeof(recent->error),
+                 "Unable to read tag documentation from the selected project.");
         tatr_list_free(&new_list);
         tatr_tags_free(&new_tags);
-        return;
+        return 0;
+    }
+
+    char project_root[PROJECT_PATH_CAPACITY];
+    char absolute_project_root[PROJECT_PATH_CAPACITY];
+    if (!project_root_from_tasks(new_tasks_dir, project_root,
+                                 sizeof(project_root)) ||
+        !make_project_path_absolute(project_root, absolute_project_root,
+                                    sizeof(absolute_project_root))) {
+        tatr_list_free(&new_list);
+        tatr_tags_free(&new_tags);
+        snprintf(recent->error, sizeof(recent->error),
+                 "Unable to determine the selected project folder.");
+        return 0;
     }
 
     tatr_sort(&new_list, state->sort_by_id, state->ascending);
@@ -1078,6 +1585,19 @@ static void choose_project(TatrList *list, TatrTagDocs *tags,
     memcpy(tasks_dir, new_tasks_dir, strlen(new_tasks_dir) + 1);
     state->selected = 0;
     state->scroll = 0;
+    recent_projects_add(recent, absolute_project_root);
+    return 1;
+}
+
+static void choose_project(TatrList *list, TatrTagDocs *tags,
+                           char *tasks_dir, size_t tasks_dir_size,
+                           UiState *state, RecentProjects *recent) {
+    char *selected = tinyfd_selectFolderDialog("Choose a TATR project folder",
+                                                NULL);
+    if (!selected) return;
+    if (open_project_path(list, tags, tasks_dir, tasks_dir_size,
+                          state, recent, selected))
+        recent->menu_open = 0;
 }
 
 static int reload_after_save(TatrList *list, TatrTagDocs *tags,
@@ -1191,15 +1711,22 @@ static int field_text_append(EditForm *form, const char *input, size_t len) {
 
     if (form->focused == 2) {
         size_t current_len = strlen(form->priority);
+        size_t selection_start;
+        size_t selection_end;
+        selection_bounds(form->priority_cursor, form->priority_anchor,
+                         &selection_start, &selection_end);
+        size_t resulting_len = current_len - (selection_end - selection_start);
         for (size_t i = 0; i < len; ++i) {
             if (!(input[i] >= '0' && input[i] <= '9') &&
-                !(input[i] == '-' && form->priority_cursor == 0 &&
-                  current_len == 0))
+                !(input[i] == '-' && selection_start == 0 &&
+                  resulting_len == 0))
                 continue;
             if (!insert_text(form->priority, sizeof(form->priority),
                              &current_len, &form->priority_cursor,
-                             input + i, 1))
+                             &form->priority_anchor, input + i, 1))
                 return 0;
+            resulting_len = current_len;
+            selection_start = form->priority_cursor;
         }
         return 1;
     }
@@ -1214,22 +1741,89 @@ static int field_text_append(EditForm *form, const char *input, size_t len) {
     }
     size_t current_len = strlen(form->title);
     return insert_text(form->title, sizeof(form->title), &current_len,
-                       &form->title_cursor, filtered, used);
+                       &form->title_cursor, &form->title_anchor,
+                       filtered, used);
 }
 
-static void move_focused_cursor(EditForm *form, int direction, int by_word) {
+static void move_focused_cursor(EditForm *form, int direction, int by_word,
+                                int extend) {
     size_t length = 0;
     size_t capacity = 0;
     char *value = focused_text(form, &length, &capacity);
     size_t *cursor = focused_cursor(form);
+    size_t *anchor = form->focused == 0 ? &form->title_anchor
+        : form->focused == 2 ? &form->priority_anchor
+        : form->focused == 4 ? &form->body_anchor : NULL;
     (void)capacity;
-    if (!value || !cursor) return;
+    if (!value || !cursor || !anchor) return;
+    size_t selection_start;
+    size_t selection_end;
+    selection_bounds(*cursor, *anchor, &selection_start, &selection_end);
+    if (!extend && selection_start != selection_end) {
+        *cursor = direction < 0 ? selection_start : selection_end;
+        *anchor = *cursor;
+        return;
+    }
+    set_cursor_anchor(cursor, anchor, extend);
     if (direction < 0) {
         *cursor = by_word ? word_left(value, *cursor)
                           : utf8_previous(value, *cursor);
     } else {
         *cursor = by_word ? word_right(value, length, *cursor)
                           : utf8_next(value, length, *cursor);
+    }
+    form->body_vertical_x_valid = 0;
+}
+
+static void move_body_vertical(EditForm *form, int direction, int extend,
+                               int max_width) {
+    size_t cursor = form->body_cursor;
+    size_t line_start = visual_line_start(form->body, form->body_len,
+                                          cursor, max_width);
+    if (!form->body_vertical_x_valid) {
+        form->body_vertical_x =
+            (int)cursor_x(form->body, line_start, form->body_cursor);
+        form->body_vertical_x_valid = 1;
+    }
+    size_t selection_start;
+    size_t selection_end;
+    selection_bounds(form->body_cursor, form->body_anchor,
+                     &selection_start, &selection_end);
+    if (!extend && selection_start != selection_end) {
+        form->body_cursor = direction < 0 ? selection_start : selection_end;
+        form->body_anchor = form->body_cursor;
+        form->body_vertical_x_valid = 0;
+        return;
+    }
+    set_cursor_anchor(&form->body_cursor, &form->body_anchor, extend);
+    form->body_cursor = vertical_cursor(form->body, form->body_len,
+                                        form->body_cursor, direction,
+                                        form->body_vertical_x, max_width);
+}
+
+static void delete_forward_focused(EditForm *form) {
+    size_t length = 0;
+    size_t capacity = 0;
+    char *value = focused_text(form, &length, &capacity);
+    size_t *cursor = focused_cursor(form);
+    size_t *anchor = form->focused == 0 ? &form->title_anchor
+        : form->focused == 2 ? &form->priority_anchor
+        : form->focused == 4 ? &form->body_anchor : NULL;
+    (void)capacity;
+    if (!value || !cursor || !anchor) return;
+    size_t start;
+    size_t end;
+    selection_bounds(*cursor, *anchor, &start, &end);
+    if (start != end) {
+        delete_selection(value, &length, cursor, anchor);
+    } else if (*cursor < length) {
+        size_t next = utf8_next(value, length, *cursor);
+        memmove(value + *cursor, value + next, length - next + 1);
+        length -= next - *cursor;
+    }
+    if (form->focused == 4) {
+        form->body_len = length;
+        form->body_vertical_x_valid = 0;
     }
 }
 
@@ -1238,15 +1832,26 @@ static void backspace_focused(EditForm *form, int by_word) {
     size_t capacity = 0;
     char *value = focused_text(form, &length, &capacity);
     size_t *cursor = focused_cursor(form);
+    size_t *anchor = form->focused == 0 ? &form->title_anchor
+        : form->focused == 2 ? &form->priority_anchor
+        : form->focused == 4 ? &form->body_anchor : NULL;
     (void)capacity;
-    if (!value || !cursor || !*cursor) return;
-    if (by_word) {
+    if (!value || !cursor || !anchor) return;
+    size_t start;
+    size_t end;
+    selection_bounds(*cursor, *anchor, &start, &end);
+    if (start != end) {
+        delete_selection(value, &length, cursor, anchor);
+    } else if (*cursor && by_word) {
         *cursor = delete_word_left(value, &length, *cursor);
-    } else {
+        *anchor = *cursor;
+    } else if (*cursor) {
         *cursor = delete_previous_character(value, &length, *cursor);
+        *anchor = *cursor;
     }
     if (form->focused == 4) {
         form->body_len = length;
+        form->body_vertical_x_valid = 0;
     }
 }
 
@@ -1315,27 +1920,71 @@ static int handle_tag_creator_input(struct fenster *window, EditForm *form,
         form->creating_tag = 0;
         form->new_tag[0] = 0;
         form->message[0] = 0;
+        state->mouse_was_down = window->mouse != 0;
+        return 0;
     }
 
     int enter = key_pressed(window, state, 10);
     int backspace = key_pressed(window, state, 8);
     int left = key_pressed(window, state, 20);
     int right = key_pressed(window, state, 19);
+    int delete_key = key_pressed(window, state, 127);
+    int extend = (window->mod & 2) != 0;
     int control = (window->mod & 1) != 0;
     size_t length = strlen(form->new_tag);
-    if (backspace)
-        form->new_tag_cursor = control
-            ? delete_word_left(form->new_tag, &length, form->new_tag_cursor)
-            : delete_previous_character(form->new_tag, &length,
-                                        form->new_tag_cursor);
-    if (left)
-        form->new_tag_cursor = control
-            ? word_left(form->new_tag, form->new_tag_cursor)
-            : utf8_previous(form->new_tag, form->new_tag_cursor);
-    if (right)
-        form->new_tag_cursor = control
-            ? word_right(form->new_tag, length, form->new_tag_cursor)
-            : utf8_next(form->new_tag, length, form->new_tag_cursor);
+    if (backspace) {
+        size_t start;
+        size_t end;
+        selection_bounds(form->new_tag_cursor, form->new_tag_anchor,
+                         &start, &end);
+        if (start != end) {
+            delete_selection(form->new_tag, &length, &form->new_tag_cursor,
+                             &form->new_tag_anchor);
+        } else if (form->new_tag_cursor) {
+            form->new_tag_cursor = control
+                ? delete_word_left(form->new_tag, &length,
+                                   form->new_tag_cursor)
+                : delete_previous_character(form->new_tag, &length,
+                                            form->new_tag_cursor);
+            form->new_tag_anchor = form->new_tag_cursor;
+        }
+    }
+    if (delete_key) {
+        size_t start;
+        size_t end;
+        selection_bounds(form->new_tag_cursor, form->new_tag_anchor,
+                         &start, &end);
+        if (start != end) {
+            delete_selection(form->new_tag, &length, &form->new_tag_cursor,
+                             &form->new_tag_anchor);
+        } else if (form->new_tag_cursor < length) {
+            size_t next = utf8_next(form->new_tag, length,
+                                    form->new_tag_cursor);
+            memmove(form->new_tag + form->new_tag_cursor,
+                    form->new_tag + next, length - next + 1);
+        }
+    }
+    if (left || right) {
+        size_t start;
+        size_t end;
+        selection_bounds(form->new_tag_cursor, form->new_tag_anchor,
+                         &start, &end);
+        if (!extend && start != end) {
+            form->new_tag_cursor = left ? start : end;
+            form->new_tag_anchor = form->new_tag_cursor;
+        } else {
+            set_cursor_anchor(&form->new_tag_cursor, &form->new_tag_anchor,
+                              extend);
+            form->new_tag_cursor = left
+                ? (control ? word_left(form->new_tag, form->new_tag_cursor)
+                           : utf8_previous(form->new_tag,
+                                           form->new_tag_cursor))
+                : (control ? word_right(form->new_tag, length,
+                                        form->new_tag_cursor)
+                           : utf8_next(form->new_tag, length,
+                                       form->new_tag_cursor));
+        }
+    }
 
     if (window->text_input_len > 0) {
         char filtered[64];
@@ -1346,7 +1995,8 @@ static int handle_tag_creator_input(struct fenster *window, EditForm *form,
             filtered[used++] = window->text_input[i];
         }
         if (!insert_text(form->new_tag, sizeof(form->new_tag), &length,
-                         &form->new_tag_cursor, filtered, used)) {
+                         &form->new_tag_cursor, &form->new_tag_anchor,
+                         filtered, used)) {
             snprintf(form->message, sizeof(form->message), "Tag name is too long.");
         } else {
             form->message[0] = 0;
@@ -1360,7 +2010,14 @@ static int handle_tag_creator_input(struct fenster *window, EditForm *form,
         if (width < 1) width = 1;
         int x = pos->x + (pos->width - width) / 2;
         int y = pos->y + pos->height / 2 - 84;
-        if (point_in_rect(window->x, window->y, x + width - 228,
+        if (point_in_rect(window->x, window->y, x + 20, y + 72,
+                          width - 40, 36)) {
+            form->new_tag_cursor = text_cursor_from_point(
+                form->new_tag, window->x, x + 30);
+            form->new_tag_anchor = form->new_tag_cursor;
+            form->text_dragging = 1;
+            form->text_drag_field = 5;
+        } else if (point_in_rect(window->x, window->y, x + width - 228,
                           y + 132, 96, 30)) {
             create_editor_tag(form, tags, tasks_dir);
         } else if (point_in_rect(window->x, window->y, x + width - 120,
@@ -1369,6 +2026,14 @@ static int handle_tag_creator_input(struct fenster *window, EditForm *form,
             form->new_tag[0] = 0;
             form->message[0] = 0;
         }
+    }
+    if (!mouse_down) form->text_dragging = 0;
+    if (mouse_down && form->text_dragging && form->text_drag_field == 5) {
+        int width = pos->width < 440 ? pos->width - 24 : 416;
+        if (width < 1) width = 1;
+        int x = pos->x + (pos->width - width) / 2;
+        form->new_tag_cursor = text_cursor_from_point(
+            form->new_tag, window->x, x + 30);
     }
     state->mouse_was_down = mouse_down;
     return 0;
@@ -1412,6 +2077,8 @@ static int handle_form_input(struct fenster *window, EditForm *form,
     int up = key_pressed(window, state, 17);
     int down = key_pressed(window, state, 18);
     int space = key_pressed(window, state, 32);
+    int delete_key = key_pressed(window, state, 127);
+    int extend = (window->mod & 2) != 0;
     int save_shortcut = enter && (window->mod & (1 | 8));
     int control = (window->mod & 1) != 0;
     if (tab) {
@@ -1439,11 +2106,13 @@ static int handle_form_input(struct fenster *window, EditForm *form,
         form->tag_scroll = 0;
         form->tag_highlight = 0;
     } else if (enter && form->focused != 4) {
+        form->tags_open = 0;
         form->focused = (form->focused + 1) % 5;
     } else if (enter && form->focused == 4) {
         if (!form_append_body(form, "\n", 1))
             snprintf(form->message, sizeof(form->message),
                      "Not enough memory to extend the description.");
+        form->body_vertical_x_valid = 0;
     }
 
     if (form->focused == 1 && space) {
@@ -1454,8 +2123,13 @@ static int handle_form_input(struct fenster *window, EditForm *form,
     if (backspace && !form->tags_open && form->focused != 1)
         backspace_focused(form, control);
     if (!form->tags_open && form->focused != 1 && form->focused != 3) {
-        if (left) move_focused_cursor(form, -1, control);
-        if (right) move_focused_cursor(form, 1, control);
+        if (delete_key) delete_forward_focused(form);
+        if (left) move_focused_cursor(form, -1, control, extend);
+        if (right) move_focused_cursor(form, 1, control, extend);
+        if (form->focused == 4 && (up || down)) {
+            move_body_vertical(form, up ? -1 : 1, extend,
+                               pos.width - 68);
+        }
     }
 
     if (!form->tags_open && form->focused != 3 &&
@@ -1466,13 +2140,16 @@ static int handle_form_input(struct fenster *window, EditForm *form,
                      "Field is full or the input is not valid here.");
         } else {
             form->message[0] = 0;
+            if (form->focused == 4) form->body_vertical_x_valid = 0;
         }
     }
 
     int mouse_down = window->mouse != 0;
+    if (!mouse_down) form->text_dragging = 0;
     if (mouse_down && !state->mouse_was_down) {
         int x = window->x;
         int y = window->y;
+        form->text_dragging = 0;
         TagMenuLayout menu = make_tag_menu_layout(&pos, tags,
                                                   form->tag_scroll);
         int menu_click_handled = 0;
@@ -1506,7 +2183,11 @@ static int handle_form_input(struct fenster *window, EditForm *form,
         if (point_in_rect(x, y, pos.x + 24, pos.y + 84,
                           pos.width - 48, 34)) {
             form->focused = 0;
-            form->title_cursor = strlen(form->title);
+            form->title_cursor =
+                text_cursor_from_point(form->title, x, pos.x + 33);
+            form->title_anchor = form->title_cursor;
+            form->text_dragging = 1;
+            form->text_drag_field = 0;
         } else if (point_in_rect(x, y, pos.status_x, pos.status_y + 16,
                                  pos.status_width, 34)) {
             form->focused = 1;
@@ -1515,7 +2196,11 @@ static int handle_form_input(struct fenster *window, EditForm *form,
         } else if (point_in_rect(x, y, pos.priority_x, pos.priority_y + 16,
                                  pos.priority_width, 34)) {
             form->focused = 2;
-            form->priority_cursor = strlen(form->priority);
+            form->priority_cursor = text_cursor_from_point(
+                form->priority, x, pos.priority_x + 9);
+            form->priority_anchor = form->priority_cursor;
+            form->text_dragging = 1;
+            form->text_drag_field = 2;
         } else if (point_in_rect(x, y, pos.x + 24, pos.tags_y,
                                  pos.width - 48, 34)) {
             form->focused = 3;
@@ -1525,6 +2210,13 @@ static int handle_form_input(struct fenster *window, EditForm *form,
         } else if (point_in_rect(x, y, pos.x + 24, pos.body_y,
                                  pos.width - 48, pos.body_height)) {
             form->focused = 4;
+            form->body_cursor = body_cursor_at_point(
+                form->body, form->body_len, x, y, pos.x + 34,
+                pos.body_y + 8, pos.width - 68);
+            form->body_anchor = form->body_cursor;
+            form->body_vertical_x_valid = 0;
+            form->text_dragging = 1;
+            form->text_drag_field = 4;
         } else if (point_in_rect(x, y, pos.save_x, pos.buttons_y,
                                  pos.button_width, 30)) {
             state->mouse_was_down = mouse_down;
@@ -1535,6 +2227,20 @@ static int handle_form_input(struct fenster *window, EditForm *form,
             edit_form_close(form);
         }
     }
+    if (mouse_down && form->text_dragging) {
+        if (form->text_drag_field == 0) {
+            form->title_cursor =
+                text_cursor_from_point(form->title, window->x, pos.x + 33);
+        } else if (form->text_drag_field == 2) {
+            form->priority_cursor = text_cursor_from_point(
+                form->priority, window->x, pos.priority_x + 9);
+        } else if (form->text_drag_field == 4) {
+            form->body_cursor = body_cursor_at_point(
+                form->body, form->body_len, window->x, window->y,
+                pos.x + 34, pos.body_y + 8, pos.width - 68);
+            form->body_vertical_x_valid = 0;
+        }
+    }
     state->mouse_was_down = mouse_down;
     return 0;
 }
@@ -1542,11 +2248,67 @@ static int handle_form_input(struct fenster *window, EditForm *form,
 static int handle_input(struct fenster *window, TatrList *list,
                          TatrTagDocs *tags, char *tasks_dir,
                          size_t tasks_dir_size, UiState *state,
-                         EditForm *form,
+                         EditForm *form, RecentProjects *recent,
                          const UiLayout *layout) {
     if (form->active)
         return handle_form_input(window, form, list, tags, tasks_dir,
                                  state, layout);
+    if (recent->menu_open) {
+        int up = key_pressed(window, state, 17);
+        int down = key_pressed(window, state, 18);
+        int enter = key_pressed(window, state, 10);
+        int escape = key_pressed(window, state, 27);
+        if (recent->count) {
+            if (up && recent->selected > 0) --recent->selected;
+            if (down && recent->selected + 1 < recent->count)
+                ++recent->selected;
+            if (enter) {
+                char selected[PROJECT_PATH_CAPACITY];
+                snprintf(selected, sizeof(selected), "%s",
+                          recent->paths[recent->selected]);
+                if (open_project_path(list, tags, tasks_dir, tasks_dir_size,
+                                       state, recent, selected))
+                    recent->menu_open = 0;
+            }
+        }
+        if (escape) recent->menu_open = 0;
+
+        int mouse_down = window->mouse != 0;
+        if (mouse_down && !state->mouse_was_down) {
+            int width = layout->width - 2 * layout->margin;
+            if (width > 640) width = 640;
+            if (width < 1) width = 1;
+            int row_height = 36;
+            int height = 82 + (int)(recent->count ? recent->count : 1) *
+                                       row_height;
+            if (height > layout->height - 2 * layout->margin)
+                height = layout->height - 2 * layout->margin;
+            int x = (layout->width - width) / 2;
+            int y = (layout->height - height) / 2;
+            int row_area_height = (int)recent->count * row_height;
+            if (recent->count &&
+                point_in_rect(window->x, window->y, x + 8, y + 62,
+                               width - 16, row_area_height)) {
+                size_t index = (size_t)(window->y - y - 62) /
+                                (size_t)row_height;
+                if (index < recent->count) {
+                    recent->selected = index;
+                    char selected[PROJECT_PATH_CAPACITY];
+                    snprintf(selected, sizeof(selected), "%s",
+                              recent->paths[index]);
+                    if (open_project_path(list, tags, tasks_dir,
+                                           tasks_dir_size, state, recent,
+                                           selected))
+                         recent->menu_open = 0;
+                }
+            } else if (!point_in_rect(window->x, window->y, x, y,
+                                       width, height)) {
+                recent->menu_open = 0;
+            }
+        }
+        state->mouse_was_down = mouse_down;
+        return 0;
+    }
     size_t count = visible_count(list, state->filter);
     int down_pressed = key_pressed(window, state, 18);
     int up_pressed = key_pressed(window, state, 17);
@@ -1587,14 +2349,38 @@ static int handle_input(struct fenster *window, TatrList *list,
     if (mouse_down && !state->mouse_was_down) {
         int x = window->x;
         int y = window->y;
-        RenRect welcome_button = welcome_button_rect(layout);
+        RenRect welcome_button = welcome_button_rect(layout, recent->count);
+        RenRect welcome_card = welcome_card_rect(layout, recent->count);
         int project_width = project_button_width(layout);
         int project_button_x = layout->width - layout->margin - project_width;
         int new_button_x = project_button_x - 112;
+        int recent_button_x = new_button_x - 108;
         if (!tasks_dir[0] &&
             point_in_rect(x, y, welcome_button.x, welcome_button.y,
                           welcome_button.width, welcome_button.height)) {
-            choose_project(list, tags, tasks_dir, tasks_dir_size, state);
+            choose_project(list, tags, tasks_dir, tasks_dir_size, state, recent);
+        } else if (!tasks_dir[0] && recent->count) {
+            int handled = 0;
+            for (size_t i = 0; i < recent->count; ++i) {
+                RenRect row = welcome_recent_row(layout, recent->count, i);
+                if (point_in_rect(x, y, row.x, row.y, row.width, row.height)) {
+                    char selected[PROJECT_PATH_CAPACITY];
+                    snprintf(selected, sizeof(selected), "%s",
+                             recent->paths[i]);
+                    open_project_path(list, tags, tasks_dir, tasks_dir_size,
+                                      state, recent, selected);
+                    handled = 1;
+                    break;
+                }
+            }
+            if (!handled && !point_in_rect(x, y, welcome_card.x,
+                                           welcome_card.y, welcome_card.width,
+                                           welcome_card.height))
+                recent->error[0] = 0;
+        } else if (tasks_dir[0] &&
+                   point_in_rect(x, y, recent_button_x, 18, 96, 30)) {
+            recent->menu_open = 1;
+            recent->selected = 0;
         } else if (tasks_dir[0] &&
                    point_in_rect(x, y, new_button_x, 18, 100, 30)) {
             if (!edit_form_open(form, NULL))
@@ -1603,7 +2389,7 @@ static int handle_input(struct fenster *window, TatrList *list,
         } else if (tasks_dir[0] &&
                    point_in_rect(x, y, project_button_x, 18,
                                  project_width, 30)) {
-            choose_project(list, tags, tasks_dir, tasks_dir_size, state);
+            choose_project(list, tags, tasks_dir, tasks_dir_size, state, recent);
         } else if (tasks_dir[0] && count) {
             const TatrTask *selected_task =
                 visible_task(list, state->filter, state->selected);
@@ -1713,7 +2499,22 @@ int tatr_desktop_ui(TatrList *list, TatrTagDocs *tags, char *tasks_dir,
                     size_t tasks_dir_size) {
     UiState state = {0};
     EditForm form = {0};
+    RecentProjects recent = {0};
     state.filter = FILTER_OPEN;
+    recent_projects_load(&recent);
+    if (tasks_dir[0]) {
+        char project_root[PROJECT_PATH_CAPACITY];
+        char absolute_project_root[PROJECT_PATH_CAPACITY];
+        if (project_root_from_tasks(tasks_dir, project_root,
+                                    sizeof(project_root)) &&
+            make_project_path_absolute(project_root, absolute_project_root,
+                                       sizeof(absolute_project_root))) {
+            recent_projects_add(&recent, absolute_project_root);
+        } else if (!recent.error[0]) {
+            snprintf(recent.error, sizeof(recent.error),
+                     "Could not add the startup project to recent history.");
+        }
+    }
     uint32_t *pixels = (uint32_t *)calloc(
         INITIAL_WINDOW_WIDTH * INITIAL_WINDOW_HEIGHT, sizeof(*pixels));
     if (!pixels) {
@@ -1749,9 +2550,9 @@ int tatr_desktop_ui(TatrList *list, TatrTagDocs *tags, char *tasks_dir,
         if (fenster_loop(&window) < 0) break;
         UiLayout layout = make_layout(window.width, window.height);
         if (handle_input(&window, list, tags, tasks_dir, tasks_dir_size,
-                         &state, &form, &layout)) running = 0;
+                         &state, &form, &recent, &layout)) running = 0;
         if (!running) break;
-        draw_ui(list, tags, tasks_dir, &state, &form, &layout);
+        draw_ui(list, tags, tasks_dir, &state, &form, &recent, &layout);
         fenster_sleep(16);
     }
 

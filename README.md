@@ -35,8 +35,11 @@ build/tatr-ui path/to/project
 ```
 
 Without an argument, the app opens a welcome window with a **Choose project
-folder** button. Use **Open project** in the task browser to switch projects.
-The chosen folder can be either the project root or its `tasks/` directory.
+folder** button and a list of recent projects. Use **Recent** or **Open project**
+in the task browser to switch projects. Up/Down and Enter select from the
+recent-project menu. The most recent ten projects are stored in
+`.tatr-ui-history` in the user's home folder. The chosen folder can be either
+the project root or its `tasks/` directory.
 
 If no system font is found automatically, set `TATR_FONT` to a TrueType font
 file. The application tries `TATR_FONT` first.
@@ -55,7 +58,10 @@ file. The application tries `TATR_FONT` first.
   **Create tag...** is the last menu item.
 - In text fields, Left/Right moves by a character and Ctrl+Left/Right moves by
   a word; Backspace deletes one character and Ctrl+Backspace deletes the
-  previous word. The description editor shows a blinking caret.
+  previous word. Shift+arrows and mouse dragging select text; typing replaces
+  the selection. In the multiline description, Up/Down moves between wrapped
+  lines while retaining the visual column. The description editor shows a
+  blinking caret.
 - In the editor, click a field or use Tab to change focus. Space toggles status;
   Enter advances fields or inserts a description newline, and Ctrl+Enter (or
   Command+Enter on macOS) saves. Escape cancels the edit.
